@@ -1,9 +1,11 @@
 package com.simibubi.create.content.trains.track.placement;
 
+import com.simibubi.create.AllDataComponents;
 import com.simibubi.create.content.trains.track.BezierConnection;
 import com.simibubi.create.content.trains.track.ITrackBlock;
 import com.simibubi.create.content.trains.track.TrackBlock;
 import com.simibubi.create.content.trains.track.TrackBlockEntity;
+import com.simibubi.create.infrastructure.config.AllConfigs;
 
 import net.createmod.catnip.data.Couple;
 import net.createmod.catnip.math.AngleHelper;
@@ -20,188 +22,307 @@ final class TrackPlacementPlanner {
 		BlockPos targetPos1, BlockPos targetPos2) {
 	}
 
+	private enum CandidateFamily {
+		STRAIGHT,
+		S_BEND,
+		RISING_STRAIGHT,
+		SLOPE,
+		TURN
+	}
+
+	private static final class PlanningContext {
+		final TrackPlacementRequest request;
+		final TrackPlacement.PlacementInfo info;
+		final ITrackBlock targetTrack;
+
+		TrackEndpoint start;
+		TrackEndpoint end;
+		boolean parallel;
+		boolean slope;
+		double ascend;
+		double absAscend;
+		double angle;
+
+		private PlanningContext(TrackPlacementRequest request, TrackPlacement.PlacementInfo info, ITrackBlock targetTrack,
+			TrackEndpoint start, TrackEndpoint end) {
+			this.request = request;
+			this.info = info;
+			this.targetTrack = targetTrack;
+			this.start = start;
+			this.end = end;
+		}
+
+		PlannedPlacement fail(String message, boolean tooJumbly) {
+			if (tooJumbly)
+				info.tooJumbly();
+			return new PlannedPlacement(info.withMessage(message), start.state, end.state, start.pos, end.pos);
+		}
+	}
+
+	private record ConnectionCandidate(
+		TrackEndpoint start, TrackEndpoint end,
+		CandidateFamily family, boolean hasCurve,
+		int end1Extent, int end2Extent, int sourceEnd1Extent,
+		double straightDistance,
+		double lateralT, double lateralTarget, double[] lateralIntersection,
+		double[] turnIntersection, double[] slopeIntersection, double turnSize,
+		double minTurnSize, double turnSizeToFitAscend, float absAngle,
+		boolean enteredFromTurn, boolean naturalSlope, boolean opposingSlopeTransition,
+		double minHorizontalDistance
+	) {
+		BlockPos targetPos1() {
+			return start.pos.offset(BlockPos.containing(start.axis.scale(end1Extent)));
+		}
+
+		BlockPos targetPos2() {
+			return end.pos.offset(BlockPos.containing(end.axis.scale(end2Extent)));
+		}
+	}
+
 	private TrackPlacementPlanner() {}
 
 	static PlannedPlacement plan(TrackPlacementRequest request, TrackPlacement.PlacementInfo info) {
-		TrackEndpoint end2 = TrackEndpoint.fromTarget(request);
-		TrackPlacement.ConnectingFrom connectingFrom = request.stack().get(com.simibubi.create.AllDataComponents.TRACK_CONNECTING_FROM);
-		TrackEndpoint end1 = TrackEndpoint.fromSelection(request.level(), connectingFrom);
+		TrackEndpoint end = TrackEndpoint.fromTarget(request);
+		TrackPlacement.ConnectingFrom connectingFrom = request.stack().get(AllDataComponents.TRACK_CONNECTING_FROM);
+		TrackEndpoint start = TrackEndpoint.fromSelection(request.level(), connectingFrom);
+		PlanningContext context = new PlanningContext(request, info, request.targetTrack(), start, end);
 
-		applyPreviewEndpoints(info, end1, end2, request.level().isClientSide);
+		applyPreviewEndpoints(info, start, end, request.level().isClientSide);
 
-		int maxLength = com.simibubi.create.infrastructure.config.AllConfigs.server().trains.maxTrackPlacementLength.get();
-		if (end1.pos.equals(end2.pos))
-			return new PlannedPlacement(info.withMessage("second_point"), end1.state, end2.state, end1.pos, end2.pos);
-		if (end1.pos.distSqr(end2.pos) > maxLength * maxLength)
-			return new PlannedPlacement(info.withMessage("too_far").tooJumbly(), end1.state, end2.state, end1.pos, end2.pos);
-		if (!end1.state.hasProperty(TrackBlock.HAS_BE))
-			return new PlannedPlacement(info.withMessage("original_missing"), end1.state, end2.state, end1.pos, end2.pos);
-		if (request.level().getBlockEntity(end2.pos) instanceof TrackBlockEntity tbe && tbe.isTilted())
-			return new PlannedPlacement(info.withMessage("turn_start"), end1.state, end2.state, end1.pos, end2.pos);
+		PlannedPlacement failure = validateInitialConditions(context);
+		if (failure != null)
+			return failure;
 
-		ITrackBlock targetTrack = request.targetTrack();
-		if (end1.axis.dot(end2.end.subtract(end1.end)) < 0) {
-			end1 = end1.flip(targetTrack, request.level());
-			updatePreviewStart(info, end1, request.level().isClientSide);
+		orientStart(context);
+		orientEnd(context);
+		updateGeometry(context);
+
+		ConnectionCandidate candidate = buildCandidate(context);
+		applyPreviewCandidate(info, candidate, request);
+
+		failure = validateCandidate(context, candidate);
+		if (failure != null)
+			return failure;
+
+		return applyCandidate(context, candidate);
+	}
+
+	private static PlannedPlacement validateInitialConditions(PlanningContext context) {
+		int maxLength = AllConfigs.server().trains.maxTrackPlacementLength.get();
+		if (context.start.pos.equals(context.end.pos))
+			return context.fail("second_point", false);
+		if (context.start.pos.distSqr(context.end.pos) > maxLength * maxLength)
+			return context.fail("too_far", true);
+		if (!context.start.state.hasProperty(TrackBlock.HAS_BE))
+			return context.fail("original_missing", false);
+		if (context.request.level().getBlockEntity(context.end.pos) instanceof TrackBlockEntity tbe && tbe.isTilted())
+			return context.fail("turn_start", false);
+		return null;
+	}
+
+	private static void orientStart(PlanningContext context) {
+		if (context.start.axis.dot(context.end.end.subtract(context.start.end)) < 0) {
+			context.start = context.start.flip(context.targetTrack, context.request.level());
+			updatePreviewStart(context.info, context.start, context.request.level().isClientSide);
+		}
+	}
+
+	private static void orientEnd(PlanningContext context) {
+		double[] intersection = horizontalIntersection(context.start, context.end);
+		boolean parallel = intersection == null;
+		if ((parallel && context.start.normedAxis.dot(context.end.normedAxis) > 0)
+			|| (!parallel && (intersection[0] < 0 || intersection[1] < 0))) {
+			context.end = context.end.flip(context.targetTrack, context.request.level());
+			updatePreviewEnd(context.info, context.end, context.request.level().isClientSide);
+		}
+	}
+
+	private static void updateGeometry(PlanningContext context) {
+		context.parallel = horizontalIntersection(context.start, context.end) == null;
+		context.angle = Mth.atan2(context.end.normedAxis.z, context.end.normedAxis.x)
+			- Mth.atan2(context.start.normedAxis.z, context.start.normedAxis.x);
+		context.ascend = context.end.end.subtract(context.start.end).y;
+		context.absAscend = Math.abs(context.ascend);
+		context.slope = !context.start.normal.equals(context.end.normal);
+	}
+
+	private static ConnectionCandidate buildCandidate(PlanningContext context) {
+		ConnectionCandidate base = context.parallel ? buildParallelCandidate(context) : buildTurnCandidate(context);
+		// slopes/rising straights refine the previously flat base
+		if (context.slope)
+			return buildSlopeCandidate(context, base);
+		if (base.family == CandidateFamily.STRAIGHT && !Mth.equal(context.ascend, 0))
+			return buildRisingStraightCandidate(context, base);
+		return base;
+	}
+
+	// parallel: either straight or s-bend
+	private static ConnectionCandidate buildParallelCandidate(PlanningContext context) {
+		Vec3 perpendicularToEnd = context.end.normedAxis.cross(new Vec3(0, 1, 0));
+		double[] lateralIntersection =
+			VecHelper.intersect(context.start.end, context.end.end, context.start.normedAxis, perpendicularToEnd, Axis.Y);
+		double t = Math.abs(lateralIntersection[0]);
+		double u = Math.abs(lateralIntersection[1]);
+		// u == 0 when the two ends are collinear
+		if (Mth.equal(u, 0)) {
+			double straightDistance = VecHelper.getCenterOf(context.start.pos)
+				.distanceTo(VecHelper.getCenterOf(context.end.pos));
+			int end1Extent = (int) Math.round((straightDistance + 1) / context.start.axis.length());
+			return new ConnectionCandidate(context.start, context.end, CandidateFamily.STRAIGHT, false, end1Extent, 0,
+				end1Extent, straightDistance, t, 0, lateralIntersection, null, null, 0, 0, 0, 0, false, false, false, 0);
 		}
 
-		double[] intersect = VecHelper.intersect(end1.end, end2.end, end1.normedAxis, end2.normedAxis, Axis.Y);
-		boolean parallel = intersect == null;
-		boolean skipCurve = false;
+		double lateralTarget = u <= 1 ? 3 : u * 2;
+		int correction = Math.max(0, (int) ((t - lateralTarget) / context.start.axis.length()));
+		int[] extents = symmetricCorrection(context.request, correction);
+		return new ConnectionCandidate(context.start, context.end, CandidateFamily.S_BEND, true, extents[0], extents[1], 0,
+			0, t, lateralTarget, lateralIntersection, null, null, 0, 0, 0, 0, false, false, false, 0);
+	}
 
-		if ((parallel && end1.normedAxis.dot(end2.normedAxis) > 0)
-			|| (!parallel && (intersect[0] < 0 || intersect[1] < 0))) {
-			end2 = end2.flip(targetTrack, request.level());
-			updatePreviewEnd(info, end2, request.level().isClientSide);
+	private static ConnectionCandidate buildSlopeCandidate(PlanningContext context, ConnectionCandidate baseCandidate) {
+		// slopes reuse the already-oriented endpoints, but add the vertical plane
+		Axis plane = Mth.equal(context.start.axis.x, 0) ? Axis.X : Axis.Z;
+		double[] slopeIntersection =
+			VecHelper.intersect(context.start.end, context.end.end, context.start.normedAxis, context.end.normedAxis, plane);
+		double dist1 = Math.abs(slopeIntersection[0] / context.start.axis.length());
+		double dist2 = Math.abs(slopeIntersection[1] / context.end.axis.length());
+		int end1Extent = dist1 > dist2 ? (int) Math.round(dist1 - dist2) : 0;
+		int end2Extent = dist2 > dist1 ? (int) Math.round(dist2 - dist1) : 0;
+		double turnSize = Math.min(dist1, dist2);
+		if (turnSize > 2 && !context.request.maximiseTurn()) {
+			end1Extent += turnSize - 2;
+			end2Extent += turnSize - 2;
 		}
 
-		Vec3 cross2 = end2.normedAxis.cross(new Vec3(0, 1, 0));
-		double angle = Mth.atan2(end2.normedAxis.z, end2.normedAxis.x) - Mth.atan2(end1.normedAxis.z, end1.normedAxis.x);
-		double ascend = end2.end.subtract(end1.end).y;
-		double absAscend = Math.abs(ascend);
-		boolean slope = !end1.normal.equals(end2.normal);
+		return new ConnectionCandidate(context.start, context.end, CandidateFamily.SLOPE, true, end1Extent, end2Extent, 0,
+			0, 0, 0, baseCandidate.lateralIntersection, baseCandidate.turnIntersection, slopeIntersection, turnSize, 2, 0,
+			0, baseCandidate.family != CandidateFamily.STRAIGHT, false, false, 0);
+	}
 
-		if (request.level().isClientSide)
-			info.curve = createCurve(end1, end2, info, request);
+	private static ConnectionCandidate buildRisingStraightCandidate(PlanningContext context, ConnectionCandidate baseCandidate) {
+		// vertical offset on a rising straight either stays "naturally" straight or becomes a transition
+		boolean naturalSlope = context.start.axis.y != 0
+			&& Mth.equal(context.absAscend + 1, baseCandidate.straightDistance / context.start.axis.length());
+		boolean opposingSlopeTransition = context.start.axis.y != 0 && context.start.axis.y == -context.end.axis.y;
+		double minHorizontalDistance =
+			Math.max(context.absAscend < 4 ? context.absAscend * 4 : context.absAscend * 3, 6) / context.start.axis.length();
+		int[] extents = naturalSlope ? new int[] {baseCandidate.end1Extent, 0}
+			: symmetricCorrection(context.request, Math.max(0, (int) (baseCandidate.end1Extent - minHorizontalDistance)));
+		return new ConnectionCandidate(context.start, context.end, CandidateFamily.RISING_STRAIGHT, !naturalSlope,
+			extents[0], extents[1], baseCandidate.end1Extent, baseCandidate.straightDistance, 0, 0,
+			baseCandidate.lateralIntersection, null, null, 0, 0, 0, 0, false, naturalSlope, opposingSlopeTransition,
+			minHorizontalDistance);
+	}
 
-		double dist = 0;
-		if (parallel) {
-			double[] sTest = VecHelper.intersect(end1.end, end2.end, end1.normedAxis, cross2, Axis.Y);
-			if (sTest != null) {
-				double t = Math.abs(sTest[0]);
-				double u = Math.abs(sTest[1]);
-
-				skipCurve = Mth.equal(u, 0);
-
-				if (!skipCurve && sTest[0] < 0)
-					return new PlannedPlacement(info.withMessage("perpendicular").tooJumbly(), end1.state, end2.state, end1.pos, end2.pos);
-
-				if (skipCurve) {
-					dist = VecHelper.getCenterOf(end1.pos).distanceTo(VecHelper.getCenterOf(end2.pos));
-					info.end1Extent = (int) Math.round((dist + 1) / end1.axis.length());
-				} else {
-					if (!Mth.equal(ascend, 0) || end1.normedAxis.y != 0)
-						return new PlannedPlacement(info.withMessage("ascending_s_curve"), end1.state, end2.state, end1.pos, end2.pos);
-
-					double targetT = u <= 1 ? 3 : u * 2;
-					if (t < targetT)
-						return new PlannedPlacement(info.withMessage("too_sharp"), end1.state, end2.state, end1.pos, end2.pos);
-
-					if (t > targetT) {
-						int correction = (int) ((t - targetT) / end1.axis.length());
-						info.end1Extent = request.maximiseTurn() ? 0 : correction / 2 + (correction % 2);
-						info.end2Extent = request.maximiseTurn() ? 0 : correction / 2;
-					}
-				}
-			}
+	private static ConnectionCandidate buildTurnCandidate(PlanningContext context) {
+		// turns are sized from the horizontal intersection and extended if the turn is wider than required
+		double[] turnIntersection = horizontalIntersection(context.start, context.end);
+		double dist1 = Math.abs(turnIntersection[0]);
+		double dist2 = Math.abs(turnIntersection[1]);
+		float ex1 = dist1 > dist2 ? (float) ((dist1 - dist2) / context.start.axis.length()) : 0;
+		float ex2 = dist2 > dist1 ? (float) ((dist2 - dist1) / context.end.axis.length()) : 0;
+		float absAngle = Math.abs(AngleHelper.deg(context.angle));
+		boolean ninety = (absAngle + .25f) % 90 < 1;
+		double turnSize = Math.min(dist1, dist2) - .1d;
+		double minTurnSize = ninety ? 7 : 3.25;
+		double turnSizeToFitAscend = minTurnSize + (ninety ? Math.max(0, context.absAscend - 3) * 2f
+			: Math.max(0, context.absAscend - 1.5f) * 1.5f);
+		if (!context.request.maximiseTurn()) {
+			ex1 += Math.max(0, turnSize - turnSizeToFitAscend) / context.start.axis.length();
+			ex2 += Math.max(0, turnSize - turnSizeToFitAscend) / context.end.axis.length();
 		}
 
-		if (slope) {
-			if (!skipCurve)
-				return new PlannedPlacement(info.withMessage("slope_turn"), end1.state, end2.state, end1.pos, end2.pos);
-			if (Mth.equal(end1.normal.dot(end2.normal), 0))
-				return new PlannedPlacement(info.withMessage("opposing_slopes"), end1.state, end2.state, end1.pos, end2.pos);
-			if ((end1.axis.y < 0 || end2.axis.y > 0) && ascend > 0)
-				return new PlannedPlacement(info.withMessage("leave_slope_ascending"), end1.state, end2.state, end1.pos, end2.pos);
-			if ((end1.axis.y > 0 || end2.axis.y < 0) && ascend < 0)
-				return new PlannedPlacement(info.withMessage("leave_slope_descending"), end1.state, end2.state, end1.pos, end2.pos);
+		return new ConnectionCandidate(context.start, context.end, CandidateFamily.TURN, true, Mth.floor(ex1), Mth.floor(ex2),
+			0, 0, 0, 0, null, turnIntersection, null, turnSize, minTurnSize, turnSizeToFitAscend, absAngle, false, false,
+			false, 0);
+	}
 
-			skipCurve = false;
-			info.end1Extent = 0;
-			info.end2Extent = 0;
+	private static PlannedPlacement validateCandidate(PlanningContext context, ConnectionCandidate candidate) {
+		return switch (candidate.family) {
+			case STRAIGHT -> null;
+			case S_BEND -> validateSBendCandidate(context, candidate);
+			case RISING_STRAIGHT -> validateRisingStraightCandidate(context, candidate);
+			case SLOPE -> validateSlopeCandidate(context, candidate);
+			case TURN -> validateTurnCandidate(context, candidate);
+		};
+	}
 
-			Axis plane = Mth.equal(end1.axis.x, 0) ? Axis.X : Axis.Z;
-			intersect = VecHelper.intersect(end1.end, end2.end, end1.normedAxis, end2.normedAxis, plane);
-			double dist1 = Math.abs(intersect[0] / end1.axis.length());
-			double dist2 = Math.abs(intersect[1] / end2.axis.length());
+	private static PlannedPlacement validateSBendCandidate(PlanningContext context, ConnectionCandidate candidate) {
+		if (candidate.lateralIntersection[0] < 0)
+			return context.fail("perpendicular", true);
+		if (!Mth.equal(context.ascend, 0) || context.start.normedAxis.y != 0)
+			return context.fail("ascending_s_curve", false);
+		if (candidate.lateralT < candidate.lateralTarget)
+			return context.fail("too_sharp", false);
+		return null;
+	}
 
-			if (dist1 > dist2)
-				info.end1Extent = (int) Math.round(dist1 - dist2);
-			if (dist2 > dist1)
-				info.end2Extent = (int) Math.round(dist2 - dist1);
+	private static PlannedPlacement validateRisingStraightCandidate(PlanningContext context, ConnectionCandidate candidate) {
+		if (candidate.naturalSlope)
+			return null;
+		if (candidate.opposingSlopeTransition)
+			return context.fail("ascending_s_curve", false);
+		if (candidate.sourceEnd1Extent < candidate.minHorizontalDistance)
+			return context.fail("too_steep", false);
+		return null;
+	}
 
-			double turnSize = Math.min(dist1, dist2);
-			if (intersect[0] < 0 || intersect[1] < 0)
-				return new PlannedPlacement(info.withMessage("too_sharp").tooJumbly(), end1.state, end2.state, end1.pos, end2.pos);
-			if (turnSize < 2)
-				return new PlannedPlacement(info.withMessage("too_sharp"), end1.state, end2.state, end1.pos, end2.pos);
+	private static PlannedPlacement validateSlopeCandidate(PlanningContext context, ConnectionCandidate candidate) {
+		if (candidate.enteredFromTurn)
+			return context.fail("slope_turn", false);
+		if (Mth.equal(context.start.normal.dot(context.end.normal), 0))
+			return context.fail("opposing_slopes", false);
+		if ((context.start.axis.y < 0 || context.end.axis.y > 0) && context.ascend > 0)
+			return context.fail("leave_slope_ascending", false);
+		if ((context.start.axis.y > 0 || context.end.axis.y < 0) && context.ascend < 0)
+			return context.fail("leave_slope_descending", false);
+		if (candidate.slopeIntersection[0] < 0 || candidate.slopeIntersection[1] < 0)
+			return context.fail("too_sharp", true);
+		if (candidate.turnSize < 2)
+			return context.fail("too_sharp", false);
+		return null;
+	}
 
-			if (turnSize > 2 && !request.maximiseTurn()) {
-				info.end1Extent += turnSize - 2;
-				info.end2Extent += turnSize - 2;
-			}
-		}
+	private static PlannedPlacement validateTurnCandidate(PlanningContext context, ConnectionCandidate candidate) {
+		if (candidate.absAngle < 60 || candidate.absAngle > 300)
+			return context.fail("turn_90", true);
+		if (candidate.turnIntersection[0] < 0 || candidate.turnIntersection[1] < 0)
+			return context.fail("too_sharp", true);
+		if (candidate.turnSize < candidate.minTurnSize)
+			return context.fail("too_sharp", false);
+		if (candidate.turnSize < candidate.turnSizeToFitAscend)
+			return context.fail("too_steep", false);
+		return null;
+	}
 
-		if (skipCurve && !Mth.equal(ascend, 0)) {
-			int hDistance = info.end1Extent;
-			if (end1.axis.y == 0 || !Mth.equal(absAscend + 1, dist / end1.axis.length())) {
-				if (end1.axis.y != 0 && end1.axis.y == -end2.axis.y)
-					return new PlannedPlacement(info.withMessage("ascending_s_curve"), end1.state, end2.state, end1.pos, end2.pos);
+	private static PlannedPlacement applyCandidate(PlanningContext context, ConnectionCandidate candidate) {
+		context.info.end1Extent = candidate.end1Extent;
+		context.info.end2Extent = candidate.end2Extent;
+		context.info.curve = candidate.hasCurve ? createCurve(candidate, context.request) : null;
+		context.info.valid = true;
+		context.info.pos1 = candidate.start.pos;
+		context.info.pos2 = candidate.end.pos;
+		context.info.axis1 = candidate.start.axis;
+		context.info.axis2 = candidate.end.axis;
+		return new PlannedPlacement(context.info, candidate.start.state, candidate.end.state, candidate.targetPos1(),
+			candidate.targetPos2());
+	}
 
-				info.end1Extent = 0;
-				double minHDistance = Math.max(absAscend < 4 ? absAscend * 4 : absAscend * 3, 6) / end1.axis.length();
-				if (hDistance < minHDistance)
-					return new PlannedPlacement(info.withMessage("too_steep"), end1.state, end2.state, end1.pos, end2.pos);
-				if (hDistance > minHDistance) {
-					int correction = (int) (hDistance - minHDistance);
-					info.end1Extent = request.maximiseTurn() ? 0 : correction / 2 + (correction % 2);
-					info.end2Extent = request.maximiseTurn() ? 0 : correction / 2;
-				}
-				skipCurve = false;
-			}
-		}
+	private static void applyPreviewCandidate(TrackPlacement.PlacementInfo info, ConnectionCandidate candidate,
+		TrackPlacementRequest request) {
+		if (!request.level().isClientSide)
+			return;
+		info.curve = candidate.hasCurve ? createCurve(candidate, request) : null;
+	}
 
-		if (!parallel) {
-			float absAngle = Math.abs(AngleHelper.deg(angle));
-			if (absAngle < 60 || absAngle > 300)
-				return new PlannedPlacement(info.withMessage("turn_90").tooJumbly(), end1.state, end2.state, end1.pos, end2.pos);
+	private static int[] symmetricCorrection(TrackPlacementRequest request, int correction) {
+		if (request.maximiseTurn())
+			return new int[] {0, 0};
+		return new int[] {correction / 2 + (correction % 2), correction / 2};
+	}
 
-			intersect = VecHelper.intersect(end1.end, end2.end, end1.normedAxis, end2.normedAxis, Axis.Y);
-			double dist1 = Math.abs(intersect[0]);
-			double dist2 = Math.abs(intersect[1]);
-			float ex1 = 0;
-			float ex2 = 0;
-
-			if (dist1 > dist2)
-				ex1 = (float) ((dist1 - dist2) / end1.axis.length());
-			if (dist2 > dist1)
-				ex2 = (float) ((dist2 - dist1) / end2.axis.length());
-
-			double turnSize = Math.min(dist1, dist2) - .1d;
-			boolean ninety = (absAngle + .25f) % 90 < 1;
-
-			if (intersect[0] < 0 || intersect[1] < 0)
-				return new PlannedPlacement(info.withMessage("too_sharp").tooJumbly(), end1.state, end2.state, end1.pos, end2.pos);
-
-			double minTurnSize = ninety ? 7 : 3.25;
-			double turnSizeToFitAscend =
-				minTurnSize + (ninety ? Math.max(0, absAscend - 3) * 2f : Math.max(0, absAscend - 1.5f) * 1.5f);
-
-			if (turnSize < minTurnSize)
-				return new PlannedPlacement(info.withMessage("too_sharp"), end1.state, end2.state, end1.pos, end2.pos);
-			if (turnSize < turnSizeToFitAscend)
-				return new PlannedPlacement(info.withMessage("too_steep"), end1.state, end2.state, end1.pos, end2.pos);
-
-			if (!request.maximiseTurn()) {
-				ex1 += (turnSize - turnSizeToFitAscend) / end1.axis.length();
-				ex2 += (turnSize - turnSizeToFitAscend) / end2.axis.length();
-			}
-			info.end1Extent = Mth.floor(ex1);
-			info.end2Extent = Mth.floor(ex2);
-		}
-
-		Vec3 offset1 = end1.axis.scale(info.end1Extent);
-		Vec3 offset2 = end2.axis.scale(info.end2Extent);
-		BlockPos targetPos1 = end1.pos.offset(BlockPos.containing(offset1));
-		BlockPos targetPos2 = end2.pos.offset(BlockPos.containing(offset2));
-
-		info.curve = skipCurve ? null : createCurve(end1, end2, info, request);
-		info.valid = true;
-		info.pos1 = end1.pos;
-		info.pos2 = end2.pos;
-		info.axis1 = end1.axis;
-		info.axis2 = end2.axis;
-		return new PlannedPlacement(info, end1.state, end2.state, targetPos1, targetPos2);
+	private static double[] horizontalIntersection(TrackEndpoint start, TrackEndpoint end) {
+		return VecHelper.intersect(start.end, end.end, start.normedAxis, end.normedAxis, Axis.Y);
 	}
 
 	private static void applyPreviewEndpoints(TrackPlacement.PlacementInfo info, TrackEndpoint start, TrackEndpoint end,
@@ -230,15 +351,12 @@ final class TrackPlacementPlanner {
 		info.axis2 = end.axis;
 	}
 
-	private static BezierConnection createCurve(TrackEndpoint start, TrackEndpoint end, TrackPlacement.PlacementInfo info,
-		TrackPlacementRequest request) {
-		Vec3 offset1 = start.axis.scale(info.end1Extent);
-		Vec3 offset2 = end.axis.scale(info.end2Extent);
-		BlockPos targetPos1 = start.pos.offset(BlockPos.containing(offset1));
-		BlockPos targetPos2 = end.pos.offset(BlockPos.containing(offset2));
-		return new BezierConnection(Couple.create(targetPos1, targetPos2),
-			Couple.create(start.end.add(offset1), end.end.add(offset2)),
-			Couple.create(start.normedAxis, end.normedAxis),
-			Couple.create(start.normal, end.normal), true, request.girder(), request.trackMaterial());
+	private static BezierConnection createCurve(ConnectionCandidate candidate, TrackPlacementRequest request) {
+		return new BezierConnection(Couple.create(candidate.targetPos1(), candidate.targetPos2()),
+			Couple.create(candidate.start.end.add(candidate.start.axis.scale(candidate.end1Extent)),
+				candidate.end.end.add(candidate.end.axis.scale(candidate.end2Extent))),
+			Couple.create(candidate.start.normedAxis, candidate.end.normedAxis),
+			Couple.create(candidate.start.normal, candidate.end.normal), true, request.girder(), request.trackMaterial());
 	}
+
 }
