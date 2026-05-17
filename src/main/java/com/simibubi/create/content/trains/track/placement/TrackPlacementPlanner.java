@@ -67,7 +67,7 @@ final class TrackPlacementPlanner {
 		double lateralT, double lateralTarget, double[] lateralIntersection,
 		double[] turnIntersection, double[] slopeIntersection, double turnSize,
 		double minTurnSize, double turnSizeToFitAscend, float absAngle,
-		boolean enteredFromTurn, boolean naturalSlope, boolean opposingSlopeTransition,
+		boolean nonStraightBase, boolean naturalSlope, boolean opposingSlopeTransition,
 		double minHorizontalDistance
 	) {
 		BlockPos targetPos1() {
@@ -180,7 +180,14 @@ final class TrackPlacementPlanner {
 	}
 
 	private static ConnectionCandidate buildSlopeCandidate(PlanningContext context, ConnectionCandidate baseCandidate) {
-		// slopes reuse the already-oriented endpoints, but add the vertical plane
+		// only straight bases have a single vertical-plane slope solution
+		if (baseCandidate.family != CandidateFamily.STRAIGHT)
+			return new ConnectionCandidate(context.start, context.end, CandidateFamily.SLOPE, baseCandidate.hasCurve,
+				baseCandidate.end1Extent, baseCandidate.end2Extent, 0, 0, baseCandidate.lateralT, baseCandidate.lateralTarget,
+				baseCandidate.lateralIntersection, baseCandidate.turnIntersection, null, baseCandidate.turnSize, 2,
+				baseCandidate.turnSizeToFitAscend, baseCandidate.absAngle, true, false, false, 0);
+
+		// straight bases can be refined by intersecting both rails in the shared vertical plane
 		Axis plane = Mth.equal(context.start.axis.x, 0) ? Axis.X : Axis.Z;
 		double[] slopeIntersection =
 			VecHelper.intersect(context.start.end, context.end.end, context.start.normedAxis, context.end.normedAxis, plane);
@@ -196,7 +203,7 @@ final class TrackPlacementPlanner {
 
 		return new ConnectionCandidate(context.start, context.end, CandidateFamily.SLOPE, true, end1Extent, end2Extent, 0,
 			0, 0, 0, baseCandidate.lateralIntersection, baseCandidate.turnIntersection, slopeIntersection, turnSize, 2, 0,
-			0, baseCandidate.family != CandidateFamily.STRAIGHT, false, false, 0);
+			0, false, false, false, 0);
 	}
 
 	private static ConnectionCandidate buildRisingStraightCandidate(PlanningContext context, ConnectionCandidate baseCandidate) {
@@ -268,7 +275,7 @@ final class TrackPlacementPlanner {
 	}
 
 	private static PlannedPlacement validateSlopeCandidate(PlanningContext context, ConnectionCandidate candidate) {
-		if (candidate.enteredFromTurn)
+		if (candidate.nonStraightBase)
 			return context.fail("slope_turn", false);
 		if (Mth.equal(context.start.normal.dot(context.end.normal), 0))
 			return context.fail("opposing_slopes", false);
