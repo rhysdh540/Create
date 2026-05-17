@@ -18,7 +18,7 @@ import com.simibubi.create.content.logistics.packager.InventorySummary;
 import com.simibubi.create.content.logistics.tableCloth.BlueprintOverlayShopContext;
 import com.simibubi.create.content.logistics.tableCloth.ShoppingListItem.ShoppingList;
 import com.simibubi.create.content.logistics.tableCloth.TableClothBlockEntity;
-import com.simibubi.create.content.trains.track.TrackPlacement.PlacementInfo;
+import com.simibubi.create.content.trains.track.placement.TrackPlacement.PlacementInfo;
 import com.simibubi.create.foundation.gui.AllGuiTextures;
 
 import net.createmod.catnip.animation.AnimationTickHolder;

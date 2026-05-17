@@ -1,4 +1,4 @@
-package com.simibubi.create.content.trains.track;
+package com.simibubi.create.content.trains.track.placement;
 
 import com.mojang.blaze3d.platform.Window;
 import com.simibubi.create.foundation.mixin.accessor.GuiAccessor;

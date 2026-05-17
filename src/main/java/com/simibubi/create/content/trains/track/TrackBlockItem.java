@@ -4,7 +4,8 @@ import com.simibubi.create.AllBlocks;
 import com.simibubi.create.AllDataComponents;
 import com.simibubi.create.AllSoundEvents;
 import com.simibubi.create.AllTags;
-import com.simibubi.create.content.trains.track.TrackPlacement.PlacementInfo;
+import com.simibubi.create.content.trains.track.placement.TrackPlacement;
+import com.simibubi.create.content.trains.track.placement.TrackPlacement.PlacementInfo;
 import com.simibubi.create.foundation.utility.CreateLang;
 
 import net.createmod.catnip.data.Pair;
@@ -109,9 +110,9 @@ public class TrackBlockItem extends BlockItem {
 		boolean hasGirder = AllBlocks.METAL_GIRDER.isIn(offhandItem);
 		PlacementInfo info = TrackPlacement.tryConnect(level, player, pos, state, stack, hasGirder, extend);
 
-		if (info.message != null && !level.isClientSide)
-			player.displayClientMessage(CreateLang.translateDirect(info.message), true);
-		if (!info.valid) {
+		if (info.getMessage() != null && !level.isClientSide)
+			player.displayClientMessage(CreateLang.translateDirect(info.getMessage()), true);
+		if (!info.isValid()) {
 			AllSoundEvents.DENY.playFrom(player, 1, 1);
 			return InteractionResult.FAIL;
 		}

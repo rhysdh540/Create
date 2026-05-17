@@ -29,7 +29,7 @@ import com.simibubi.create.content.processing.sequenced.SequencedAssemblyRecipe.
 import com.simibubi.create.content.redstone.displayLink.ClickToLinkBlockItem.ClickToLinkData;
 import com.simibubi.create.content.schematics.cannon.SchematicannonBlockEntity.SchematicannonOptions;
 import com.simibubi.create.content.trains.track.BezierTrackPointLocation;
-import com.simibubi.create.content.trains.track.TrackPlacement.ConnectingFrom;
+import com.simibubi.create.content.trains.track.placement.TrackPlacement.ConnectingFrom;
 
 import net.createmod.catnip.codecs.stream.CatnipStreamCodecBuilders;
 import net.createmod.catnip.codecs.stream.CatnipStreamCodecs;

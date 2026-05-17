@@ -1,4 +1,4 @@
-package com.simibubi.create.content.trains.track;
+package com.simibubi.create.content.trains.track.placement;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -11,8 +11,15 @@ import com.mojang.serialization.codecs.RecordCodecBuilder;
 import com.simibubi.create.AllDataComponents;
 import com.simibubi.create.AllSpecialTextures;
 import com.simibubi.create.AllTags;
-import com.simibubi.create.AllTags.AllItemTags;
 import com.simibubi.create.content.equipment.blueprint.BlueprintOverlayRenderer;
+import com.simibubi.create.content.trains.track.BezierConnection;
+import com.simibubi.create.content.trains.track.ITrackBlock;
+import com.simibubi.create.content.trains.track.TrackBlock;
+import com.simibubi.create.content.trains.track.TrackBlockEntity;
+import com.simibubi.create.content.trains.track.TrackBlockItem;
+import com.simibubi.create.content.trains.track.TrackMaterial;
+import com.simibubi.create.content.trains.track.TrackPaver;
+import com.simibubi.create.content.trains.track.TrackShape;
 import com.simibubi.create.foundation.block.ProperWaterloggedBlock;
 import com.simibubi.create.foundation.utility.BlockHelper;
 import com.simibubi.create.foundation.utility.CreateLang;
@@ -40,7 +47,6 @@ import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
@@ -110,11 +116,19 @@ public class TrackPlacement {
 			return this;
 		}
 
-		public PlacementInfo tooJumbly() {
-			curve = null;
-			return this;
+			public PlacementInfo tooJumbly() {
+				curve = null;
+				return this;
+			}
+
+			public String getMessage() {
+				return message;
+			}
+
+			public boolean isValid() {
+				return valid;
+			}
 		}
-	}
 
 	public static PlacementInfo cached;
 
@@ -390,88 +404,26 @@ public class TrackPlacement {
 
 		placeTracks(level, info, state1, state2, targetPos1, targetPos2, true);
 
-		ItemStack offhandItem = player.getOffhandItem()
-			.copy();
-		boolean shouldPave = offhandItem.getItem() instanceof BlockItem && !AllItemTags.INVALID_FOR_TRACK_PAVING.matches(offhandItem);
+		ItemStack offhandItem = player.getOffhandItem().copy();
+		BlockItem paveItem = TrackPlacementItemRequirements.getPavingItem(offhandItem);
+		boolean shouldPave = paveItem != null;
 		if (shouldPave) {
-			BlockItem paveItem = (BlockItem) offhandItem.getItem();
 			paveTracks(level, info, paveItem, true);
 			info.hasRequiredPavement = true;
 		}
 
 		info.hasRequiredTracks = true;
 
-		if (!player.isCreative()) {
-			for (boolean simulate : Iterate.trueAndFalse) {
-				if (level.isClientSide && !simulate)
-					break;
+		if (!player.isCreative())
+			info = TrackPlacementItemRequirements.verifyOrConsume(level, player, stack, offhandItem, info);
 
-				int tracks = info.requiredTracks;
-				int pavement = info.requiredPavement;
-				int foundTracks = 0;
-				int foundPavement = 0;
-
-				Inventory inv = player.getInventory();
-				int size = inv.items.size();
-				for (int j = 0; j <= size + 1; j++) {
-					int i = j;
-					boolean offhand = j == size + 1;
-					if (j == size)
-						i = inv.selected;
-					else if (offhand)
-						i = 0;
-					else if (j == inv.selected)
-						continue;
-
-					ItemStack stackInSlot = (offhand ? inv.offhand : inv.items).get(i);
-					boolean isTrack = AllTags.AllBlockTags.TRACKS.matches(stackInSlot) && stackInSlot.is(stack.getItem());
-					if (!isTrack && (!shouldPave || offhandItem.getItem() != stackInSlot.getItem()))
-						continue;
-					if (isTrack ? foundTracks >= tracks : foundPavement >= pavement)
-						continue;
-
-					int count = stackInSlot.getCount();
-
-					if (!simulate) {
-						int remainingItems =
-							count - Math.min(isTrack ? tracks - foundTracks : pavement - foundPavement, count);
-						if (i == inv.selected)
-							stackInSlot.remove(AllDataComponents.TRACK_CONNECTING_FROM);
-						ItemStack newItem = stackInSlot.copyWithCount(remainingItems);
-						if (offhand)
-							player.setItemInHand(InteractionHand.OFF_HAND, newItem);
-						else
-							inv.setItem(i, newItem);
-					}
-
-					if (isTrack)
-						foundTracks += count;
-					else
-						foundPavement += count;
-				}
-
-				if (simulate && foundTracks < tracks) {
-					info.valid = false;
-					info.tooJumbly();
-					info.hasRequiredTracks = false;
-					return info.withMessage("not_enough_tracks");
-				}
-
-				if (simulate && foundPavement < pavement) {
-					info.valid = false;
-					info.tooJumbly();
-					info.hasRequiredPavement = false;
-					return info.withMessage("not_enough_pavement");
-				}
-			}
-		}
+		if (!info.valid)
+			return info;
 
 		if (level.isClientSide())
 			return info;
-		if (shouldPave) {
-			BlockItem paveItem = (BlockItem) offhandItem.getItem();
+		if (shouldPave)
 			paveTracks(level, info, paveItem, false);
-		}
 		return placeTracks(level, info, state1, state2, targetPos1, targetPos2, false);
 	}
 
